@@ -1,0 +1,384 @@
+"""
+任务管理器（单例）- 优化版
+
+改进：
+- 实现实际的 WebSocket 广播逻辑
+- 批量推送优化（节流）
+- 任务过期清理
+- 线程安全的状态更新
+"""
+import uuid
+import logging
+import threading
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, List, Any, Set
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+from app.models.schemas import ConversionTask, ConversionConfig
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WebSocketConnection:
+    """WebSocket 连接信息"""
+    websocket: Any
+    subscribed_tasks: Set[str] = field(default_factory=set)
+    last_ping: datetime = field(default_factory=datetime.now)
+
+
+class TaskManager:
+    """任务管理器（单例 - 优化版）"""
+
+    _instance: Optional['TaskManager'] = None
+    _lock = threading.Lock()
+
+    # 批量推送配置
+    BATCH_INTERVAL_SECONDS = 0.1  # 降低到 0.1s 以实现极致实时感
+    MAX_BATCH_SIZE = 5  # 降低批次大小以提高实时性
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                # 双重检查锁定模式
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+
+        self.tasks: Dict[str, ConversionTask] = {}
+        self.websocket_connections: Dict[str, Set[Any]] = defaultdict(set)
+        
+        # 尝试提前捕获主循环
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+        self._pending_messages: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._message_lock = threading.Lock()
+
+        # 启动后台推送任务
+        self._running = True
+        self._batch_thread = threading.Thread(target=self._batch_broadcast_worker, daemon=True)
+        self._batch_thread.start()
+
+        self._initialized = True
+        logger.info("Task manager initialized (optimized version)")
+
+    def create_task(self, config: ConversionConfig) -> str:
+        """创建新任务"""
+        import traceback
+
+        task_id = str(uuid.uuid4())
+        now = datetime.now()
+
+        logger.info(f"[TaskManager.create_task] Starting task creation")
+        logger.info(f"[TaskManager.create_task] config type: {type(config)}")
+        logger.info(f"[TaskManager.create_task] config value: {config}")
+
+        try:
+            task = ConversionTask(
+                task_id=task_id,
+                status="pending",
+                progress=0,
+                current_step="",
+                config=config,
+                created_at=now,
+                updated_at=now
+            )
+            logger.info(f"[TaskManager.create_task] ConversionTask created successfully")
+        except Exception as e:
+            logger.error(f"[TaskManager.create_task] ConversionTask creation failed: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+        self.tasks[task_id] = task
+        logger.info(f"[TaskManager.create_task] Task stored: {task_id}")
+        return task_id
+
+    def get_task(self, task_id: str) -> Optional[ConversionTask]:
+        """获取任务状态"""
+        return self.tasks.get(task_id)
+
+    def update_progress(self, task_id: str, progress: int, step: str):
+        """更新任务进度（线程安全）"""
+        with self._lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].progress = progress
+                self.tasks[task_id].current_step = step
+                self.tasks[task_id].updated_at = datetime.now()
+
+        # 添加到待推送队列（批量发送）
+        self._queue_progress_message(task_id, progress, step)
+
+    def add_log(self, task_id: str, log: str):
+        """添加日志到任务并推送到 WebSocket
+        
+        Args:
+            task_id: 任务 ID
+            log: 日志内容
+        """
+        logger.info(f"[Task {task_id}] {log}")
+        
+        # 💡 保存日志到历史记录
+        with self._lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].logs.append(log)
+                self.tasks[task_id].updated_at = datetime.now()
+
+        # 推送日志消息到 WebSocket
+        self._queue_log_message(task_id, log)
+
+    def _queue_progress_message(self, task_id: str, progress: int, step: str):
+        """将进度消息添加到待推送队列"""
+        message = {
+            "type": "progress",
+            "task_id": task_id,
+            "progress": progress,
+            "step": step,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        with self._message_lock:
+            self._pending_messages[task_id].append(message)
+
+            # 如果消息数量超过阈值，立即刷新
+            if len(self._pending_messages[task_id]) >= self.MAX_BATCH_SIZE:
+                messages = self._pending_messages[task_id]
+                self._pending_messages[task_id] = []
+                # 在锁外发送以避免阻塞
+                self._send_batch_messages(task_id, messages)
+
+    def _queue_log_message(self, task_id: str, log: str):
+        """将日志消息添加到待推送队列
+
+        Args:
+            task_id: 任务 ID
+            log: 日志内容
+        """
+        message = {
+            "type": "log",
+            "task_id": task_id,
+            "log": log,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        with self._message_lock:
+            self._pending_messages[task_id].append(message)
+
+            # 日志消息立即刷新（不等待批量）
+            messages = self._pending_messages[task_id]
+            self._pending_messages[task_id] = []
+            self._send_batch_messages(task_id, messages)
+
+    def _batch_broadcast_worker(self) -> None:
+        """后台批量推送工作线程"""
+        import time
+
+        while self._running:
+            time.sleep(self.BATCH_INTERVAL_SECONDS)
+            self._flush_pending_messages()
+
+    def _flush_pending_messages(self) -> None:
+        """刷新待推送消息"""
+        with self._message_lock:
+            if not self._pending_messages:
+                return
+
+            # 复制并清空待推送队列
+            messages_to_send = dict(self._pending_messages)
+            self._pending_messages.clear()
+
+        # 发送消息
+        for task_id, messages in messages_to_send.items():
+            if messages:
+                self._send_batch_messages(task_id, messages)
+
+    def _send_batch_messages(self, task_id: str, messages: List[Dict[str, Any]]) -> None:
+        """发送批量消息到 WebSocket"""
+        import json
+
+        with self._lock:
+            if task_id not in self.websocket_connections or not self.websocket_connections[task_id]:
+                return
+            # 复制连接集合以避免迭代时修改
+            connections = list(self.websocket_connections[task_id])
+
+        for websocket in connections:
+            try:
+                # 修改：不再只取最后一条消息，而是发送所有消息
+                # 这样可以确保日志不会因为批量更新而丢失
+                for msg in messages:
+                    if hasattr(websocket, 'send_json'):
+                        # FastAPI WebSocket - 确保在主事件循环中执行
+                        try:
+                            import asyncio
+                            # 1. 优先使用已存储的主循环（这是最可靠的，因为它在 lifespan 中捕获）
+                            loop = getattr(self, '_main_loop', None)
+                            
+                            # 2. 如果没存，尝试获取当前线程的循环 (通常只在主线程有效)
+                            if not loop:
+                                try:
+                                    loop = asyncio.get_running_loop()
+                                except RuntimeError:
+                                    loop = asyncio.get_event_loop()
+
+                            if loop and loop.is_running():
+                                # 使用 run_coroutine_threadsafe 确保非 asyncio 线程也能发送
+                                asyncio.run_coroutine_threadsafe(websocket.send_json(msg), loop)
+                                # logger.debug(f"已排队 WebSocket 消息 (task_id={task_id})")
+                            else:
+                                logger.warning(f"Cannot send WebSocket: loop not running or does not exist (task_id={task_id})")
+                        except Exception as e:
+                            logger.error(f"WebSocket dispatch failed (task_id={task_id}): {e}")
+                    else:
+                        # 标准 WebSocket
+                        websocket.send(json.dumps(msg))
+
+            except Exception as e:
+                logger.error(f"Failed to send WebSocket message (task_id={task_id}): {e}")
+                # 移除失效连接
+                self.unregister_websocket(task_id, websocket)
+
+    def register_websocket(self, task_id: str, websocket: Any) -> None:
+        """注册 WebSocket 连接"""
+        # 记录当前事件循环，供后台线程使用
+        import asyncio
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+        with self._lock:
+            self.websocket_connections[task_id].add(websocket)
+            
+        logger.info(f"WebSocket registered: task={task_id}, current connections: {len(self.websocket_connections[task_id])}")
+
+    def unregister_websocket(self, task_id: str, websocket: Any) -> None:
+        """注销 WebSocket 连接"""
+        with self._lock:
+            if task_id in self.websocket_connections:
+                self.websocket_connections[task_id].discard(websocket)
+                # 💡 修复死锁：移除嵌套的 _lock，直接在当前锁内操作
+                if not self.websocket_connections[task_id]:
+                    self.websocket_connections.pop(task_id, None)
+                logger.info(f"WebSocket unregistered: task={task_id}")
+
+    def complete_task(self, task_id: str, output_filename: str) -> None:
+        """标记任务完成"""
+        with self._lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].status = "completed"
+                self.tasks[task_id].progress = 100
+                self.tasks[task_id].completed_at = datetime.now()
+                self.tasks[task_id].output_filename = output_filename
+                self.tasks[task_id].updated_at = datetime.now()
+
+        # 立即发送完成通知
+        self._queue_status_message(task_id, "completed", output_filename=output_filename)
+
+    def fail_task(self, task_id: str, error: str) -> None:
+        """标记任务失败"""
+        with self._lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].status = "failed"
+                self.tasks[task_id].error_message = error
+                self.tasks[task_id].updated_at = datetime.now()
+
+        # 立即发送失败通知
+        self._queue_status_message(task_id, "failed", error=error)
+
+    def _queue_status_message(self, task_id: str, status: str, **kwargs) -> None:
+        """排队状态消息"""
+        # 💡 修复格式：将状态包装在 data 中，与 websocket.py 和前端一致
+        message = {
+            "type": "status",
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "data": {
+                "status": status,
+                **kwargs
+            }
+        }
+
+        with self._message_lock:
+            self._pending_messages[task_id].append(message)
+
+        # 状态变化立即刷新
+        self._flush_pending_messages()
+
+    def cleanup_old_tasks(self, max_age_hours: int = 24) -> int:
+        """清理过期任务
+
+        Args:
+            max_age_hours: 最大任务保留时间（小时）
+
+        Returns:
+            清理的任务数量
+        """
+        cleaned = 0
+        now = datetime.now()
+
+        with self._lock:
+            tasks_to_remove = []
+            for task_id, task in self.tasks.items():
+                if task.completed_at:
+                    age_hours = (now - task.completed_at).total_seconds() / 3600
+                else:
+                    age_hours = (now - task.created_at).total_seconds() / 3600
+
+                if age_hours > max_age_hours:
+                    tasks_to_remove.append(task_id)
+
+            for task_id in tasks_to_remove:
+                del self.tasks[task_id]
+                if task_id in self._pending_messages:
+                    del self._pending_messages[task_id]
+                cleaned += 1
+
+        if cleaned > 0:
+            logger.info(f"Cleaned {cleaned} expired tasks")
+
+        return cleaned
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取任务统计信息"""
+        total = len(self.tasks)
+        pending = sum(1 for t in self.tasks.values() if t.status == "pending")
+        running = sum(1 for t in self.tasks.values() if t.status == "running")
+        completed = sum(1 for t in self.tasks.values() if t.status == "completed")
+        failed = sum(1 for t in self.tasks.values() if t.status == "failed")
+
+        return {
+            "total_tasks": total,
+            "pending": pending,
+            "running": running,
+            "completed": completed,
+            "failed": failed,
+            "active_websockets": len(self.websocket_connections)
+        }
+
+    def shutdown(self) -> None:
+        """关闭任务管理器"""
+        self._running = False
+        # 刷新剩余消息
+        self._flush_pending_messages()
+        logger.info("Task manager shutdown complete")
+
+
+# 单例获取函数
+_task_manager: Optional[TaskManager] = None
+
+
+def get_task_manager() -> TaskManager:
+    """获取任务管理器单例"""
+    global _task_manager
+    if _task_manager is None:
+        _task_manager = TaskManager()
+    return _task_manager
